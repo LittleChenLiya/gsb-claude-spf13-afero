@@ -179,6 +179,32 @@ data2, _ := afero.ReadFile(cachedFs, "data.json")
 
 **Problem:** You need to expose filesystem access to a plugin, template engine, or user-submitted process but directory traversal must be impossible. It should only ever see a single rooted directory.
 
+### Example 4: Fault Injection for Error-Path Testing
+
+**Problem:** You need to verify how your application reacts to disk-full, rename
+or close errors, but you cannot (and do not want to) fill a real disk.
+
+`FaultInjectingFs` wraps any backend and injects failures based on the cleaned
+path, the operation kind (`open`, `read`, `write`, `rename`, `close`) and the
+Nth matching call. Rules are checked in declaration order and only the first
+matching rule is used. A write rule can forward a prefix of the payload to the
+backend before failing, so callers observe a genuine short write. Counters are
+isolated per wrapper instance and are safe under concurrent use.
+
+```go
+fs := afero.NewFaultInjectingFs(afero.NewMemMapFs(), afero.FaultRule{
+    Op:          afero.InjectWrite,
+    Path:        "data/export.bin",
+    N:           2,            // fire on the second Write to this path
+    WritePrefix: 3,            // first 3 bytes really land before the error
+    Repeat:      false,        // fire only once (true repeats from N on)
+    Err:         errNoSpace,   // errors.Is keeps identifying the cause
+})
+
+// Turn injection off: the wrapper then behaves like the underlying Fs.
+fs.SetEnabled(false)
+```
+
 ```go
 osFs := afero.NewOsFs()
 
