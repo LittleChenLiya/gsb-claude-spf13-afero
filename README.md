@@ -320,6 +320,50 @@ func TestSaveUserData(t *testing.T) {
 - 🔒 **Safe** - Can't accidentally modify real files
 - 🏃 **Parallel** - Tests can run concurrently without conflicts
 
+### Read-Only Directory Diffing
+
+`DirDiffer` compares two Afero directory trees **read-only**: it never creates,
+copies, renames or deletes anything on either side. Entries are matched by their
+slash-separated **relative path**, classified as regular file, directory or
+symlink (other node kinds such as named pipes are reported explicitly as
+`unsupported`), and regular files are compared with **chunked per-block
+digests** rather than modification times, so memory use stays bounded by the
+block size no matter how large the files are. Sizes and metadata are checked
+before and after reading; a file that changes mid-comparison is reported as
+`unstable` instead of being falsely called equal.
+
+```go
+differ := afero.NewDirDiffer(
+    afero.WithChunkSize(64*1024), // streaming block size (default 64KiB)
+    // afero.WithHash(sha256.New), // per-block digest (default sha256)
+)
+
+diffs, err := differ.DiffTrees(baseFs, "/snapshots/before", newFs, "/snapshots/after")
+if err != nil {
+    log.Fatal(err) // real I/O errors are returned, not hidden in the report
+}
+for _, d := range diffs {
+    fmt.Println(d.String()) // stable, sorted, human-readable output
+}
+```
+
+Each result is a `Diff{RelPath, Type, BaseType, NewType, BaseSize, NewSize, Detail}`.
+`Type` is one of:
+
+| Type | Meaning |
+| --- | --- |
+| `added` | path exists only in the new tree |
+| `missing` | path exists only in the base tree |
+| `type_conflict` | same path, different node kind (e.g. file vs. directory); children beneath the conflict are not listed separately |
+| `content_changed` | regular-file bytes or symlink targets differ — equal mtime and size are not enough |
+| `unstable` | size/metadata changed while the entry was being read |
+| `unsupported` | special node kind (pipe, socket, device, ...) that is not compared |
+
+Diffs are stably sorted by relative path (then type). Symlinks are observed via
+`LstatIfPossible` and their targets via `ReadlinkIfPossible`; filesystems that
+do not expose links transparently fall back to stat-based classification. A
+runnable printing demo lives in `ExampleNewDirDiffer` (`diff_test.go`).
+
 ## Afero vs. `io/fs` (Go 1.16+)
 
 Go 1.16 introduced the `io/fs` package, which provides a standard abstraction for **read-only** filesystems.
