@@ -33,6 +33,13 @@ type MemMapFs struct {
 	mu   sync.RWMutex
 	data map[string]*mem.FileData
 	init sync.Once
+
+	// vc is a monotonically increasing version counter. Every mutation of
+	// the filesystem bumps vc and records the new value in versions for
+	// every affected path. It is used, together with CommitTxn, to provide
+	// optimistic concurrency control for transactional overlays.
+	vc       uint64
+	versions map[string]uint64
 }
 
 func NewMemMapFs() Fs {
@@ -47,6 +54,7 @@ func (m *MemMapFs) getData() map[string]*mem.FileData {
 		root := mem.CreateDir(FilePathSeparator)
 		mem.SetMode(root, os.ModeDir|0o755)
 		m.data[FilePathSeparator] = root
+		m.versions = make(map[string]uint64)
 	})
 	return m.data
 }
@@ -60,6 +68,7 @@ func (m *MemMapFs) Create(name string) (File, error) {
 	mem.SetMode(file, 0o666)
 	m.getData()[name] = file
 	m.registerWithParent(file, 0)
+	m.bumpVersionsLocked(name, parentDir(name))
 	m.mu.Unlock()
 	return mem.NewFileHandle(file), nil
 }
@@ -176,6 +185,7 @@ func (m *MemMapFs) Mkdir(name string, perm os.FileMode) error {
 	mem.SetMode(item, os.ModeDir|perm)
 	m.getData()[name] = item
 	m.registerWithParent(item, perm)
+	m.bumpVersionsLocked(name, parentDir(name))
 	m.mu.Unlock()
 
 	return m.setFileMode(name, perm|os.ModeDir)
@@ -262,6 +272,14 @@ func (m *MemMapFs) lockfreeOpen(name string) (*mem.FileData, error) {
 func (m *MemMapFs) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
 	perm &= chmodBits
 	chmod := false
+	if flag&(os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_CREATE|os.O_TRUNC) != 0 {
+		// The file is about to be modified through the returned handle;
+		// bump the version up front so concurrent transactions observe
+		// the change.
+		m.mu.Lock()
+		m.bumpVersionsLocked(name, parentDir(name))
+		m.mu.Unlock()
+	}
 	file, err := m.openWrite(name)
 	if err == nil && (flag&os.O_EXCL > 0) {
 		return nil, &os.PathError{Op: "open", Path: name, Err: ErrFileExists}
@@ -308,6 +326,7 @@ func (m *MemMapFs) Remove(name string) error {
 			return &os.PathError{Op: "remove", Path: name, Err: err}
 		}
 		delete(m.getData(), name)
+		m.bumpVersionsLocked(name, parentDir(name))
 	} else {
 		return &os.PathError{Op: "remove", Path: name, Err: os.ErrNotExist}
 	}
@@ -317,22 +336,26 @@ func (m *MemMapFs) Remove(name string) error {
 func (m *MemMapFs) RemoveAll(path string) error {
 	path = normalizePath(path)
 	m.mu.Lock()
-	m.unRegisterWithParent(path)
-	m.mu.Unlock()
+	defer m.mu.Unlock()
+	m.lockfreeRemoveAllLocked(path)
+	return nil
+}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// lockfreeRemoveAllLocked removes path and all its descendants. The caller
+// must hold m.mu.
+func (m *MemMapFs) lockfreeRemoveAllLocked(path string) {
+	path = normalizePath(path)
+	// Remove from the parent dir; ignore errors for non-existent paths.
+	_ = m.unRegisterWithParent(path)
 
+	bumped := []string{path, parentDir(path)}
 	for p := range m.getData() {
 		if p == path || strings.HasPrefix(p, path+FilePathSeparator) {
-			m.mu.RUnlock()
-			m.mu.Lock()
 			delete(m.getData(), p)
-			m.mu.Unlock()
-			m.mu.RLock()
+			bumped = append(bumped, p)
 		}
 	}
-	return nil
+	m.bumpVersionsLocked(bumped...)
 }
 
 func (m *MemMapFs) Rename(oldname, newname string) error {
@@ -343,34 +366,50 @@ func (m *MemMapFs) Rename(oldname, newname string) error {
 		return nil
 	}
 
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if _, ok := m.getData()[oldname]; ok {
-		m.mu.RUnlock()
-		m.mu.Lock()
-		err := m.unRegisterWithParent(oldname)
-		if err != nil {
-			return err
-		}
-
-		fileData := m.getData()[oldname]
-		mem.ChangeFileName(fileData, newname)
-		m.getData()[newname] = fileData
-
-		err = m.renameDescendants(oldname, newname)
-		if err != nil {
-			return err
-		}
-
-		delete(m.getData(), oldname)
-
-		m.registerWithParent(fileData, 0)
-		m.mu.Unlock()
-		m.mu.RLock()
-	} else {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.getData()[oldname]; !ok {
 		return &os.PathError{Op: "rename", Path: oldname, Err: ErrFileNotFound}
 	}
+	m.lockfreeRenameLocked(oldname, newname)
 	return nil
+}
+
+// lockfreeRenameLocked renames oldname to newname, moving all descendants
+// along. The caller must hold m.mu and must have verified that oldname
+// exists.
+func (m *MemMapFs) lockfreeRenameLocked(oldname, newname string) {
+	oldname = normalizePath(oldname)
+	newname = normalizePath(newname)
+
+	if oldname == newname {
+		return
+	}
+
+	bumped := []string{oldname, newname, parentDir(oldname), parentDir(newname)}
+	for _, desc := range m.findDescendants(oldname) {
+		bumped = append(bumped, desc.Name())
+	}
+
+	err := m.unRegisterWithParent(oldname)
+	if err != nil {
+		return
+	}
+
+	fileData := m.getData()[oldname]
+	mem.ChangeFileName(fileData, newname)
+	m.getData()[newname] = fileData
+
+	_ = m.renameDescendants(oldname, newname)
+
+	delete(m.getData(), oldname)
+
+	m.registerWithParent(fileData, 0)
+
+	for _, desc := range m.findDescendants(newname) {
+		bumped = append(bumped, desc.Name())
+	}
+	m.bumpVersionsLocked(bumped...)
 }
 
 func (m *MemMapFs) renameDescendants(oldname, newname string) error {
@@ -438,6 +477,7 @@ func (m *MemMapFs) setFileMode(name string, mode os.FileMode) error {
 
 	m.mu.Lock()
 	mem.SetMode(f, mode)
+	m.bumpVersionsLocked(name)
 	m.mu.Unlock()
 
 	return nil
@@ -453,8 +493,11 @@ func (m *MemMapFs) Chown(name string, uid, gid int) error {
 		return &os.PathError{Op: "chown", Path: name, Err: ErrFileNotFound}
 	}
 
+	m.mu.Lock()
 	mem.SetUID(f, uid)
 	mem.SetGID(f, gid)
+	m.bumpVersionsLocked(name)
+	m.mu.Unlock()
 
 	return nil
 }
@@ -471,6 +514,7 @@ func (m *MemMapFs) Chtimes(name string, atime time.Time, mtime time.Time) error 
 
 	m.mu.Lock()
 	mem.SetModTime(f, mtime)
+	m.bumpVersionsLocked(name)
 	m.mu.Unlock()
 
 	return nil
